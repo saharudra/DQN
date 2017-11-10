@@ -8,6 +8,8 @@ import env_wrappers
 import random
 import os
 import argparse
+from collections import deque
+from gym.wrappers import Monitor
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--eval', action="store_true", default=False, help='Run in eval mode')
@@ -32,27 +34,37 @@ class DQN(object):
     def __init__(self, env):
 
         self.env = env
-        self.sess = tf.Session()
+
+        self.monitor_dir = os.path.join(os.path.dirname(__file__), 'models/monitor_dir/')
 
         # A few starter hyperparameters
-        self.batch_size = 128
+        self.batch_size = 512
         self.gamma = 0.99
         # If using e-greedy exploration
-        self.eps_start = 0.9
-        self.eps_end = 0.05
-        self.eps_decay = 1000 # in episodes
+        self.eps_start = initial_eps
+        self.eps_end = final_eps
+        self.eps_mid = mid_eps
+        self.eps_decay = 2000
+        self.eps_decay_later = 3000# in episodes
         # If using a target network
         self.clone_steps = 5000
 
-        # memory
-        self.replay_memory = ReplayMemory(100000)
+        self.sanity_epochs = 100
+        self.max_episode = 1000000
+
+        # using a deque for replay memory instead of provided implementation
+        self.replay_memory = deque()
         # Perhaps you want to have some samples in the memory before starting to train?
-        self.min_replay_size = 10000
+        self.min_replay_size = 100000
 
         # define yours training operations here...
-        self.observation_input = tf.placeholder(tf.float32, shape=[None] + list(self.env.observation_space.shape))
+        self.observation_input = tf.placeholder(tf.float32, shape=[None] + list(env.observation_space.shape),
+                                                name="input")
+        self.action_input = tf.placeholder(tf.float32, [None, env.action_space.n])
+        self.y = tf.placeholder(tf.float32, [None])
         self.keep_prob = tf.placeholder(tf.float32)
-        q_values = self.build_model(self.observation_input)
+        self.build_model()
+        self.update()
 
         # define your update operations here...
         self.ini_random_walk_prob = 1.0
@@ -61,11 +73,12 @@ class DQN(object):
 
         self.num_episodes = 0
         self.num_steps = 0
-
+        self.sess = tf.Session()
         self.saver = tf.train.Saver(tf.trainable_variables())
         self.sess.run(tf.global_variables_initializer())
 
-    def build_model(self, observation_input, scope='train'):
+
+    def build_model(self, scope='train'):
         """
         TODO: Define the tensorflow model
 
@@ -74,25 +87,20 @@ class DQN(object):
         Currently returns an op that gives all zeros.
         """
         with tf.variable_scope(scope):
-            self.observation_input = observation_input
-            self.w1 = tf.get_variable('w1', list(self.env.observation_space.shape) + [256],
-                                      initializer=tf.random_uniform_initializer(0, 1))
-            self.b1 = tf.Variable(tf.constant(0.01, shape=[256, ]), name='b1')
+            self.w1 = tf.get_variable('w1', list(env.observation_space.shape) + [512],
+                                      initializer=tf.random_uniform_initializer(0, 0.1))
+            self.b1 = tf.Variable(tf.constant(0.01, shape=[512, ]), name='b1')
             self.z1 = tf.nn.dropout(tf.nn.relu(tf.add(tf.matmul(self.observation_input, self.w1), self.b1)),
                                     keep_prob=self.keep_prob)
 
-            self.w2 = tf.get_variable('w2', [256, 256], initializer=tf.random_uniform_initializer(0, 1))
+            self.w2 = tf.get_variable('w2', [512, 256], initializer=tf.random_uniform_initializer(0, 0.1))
             self.b2 = tf.Variable(tf.constant(0.01, shape=[256, ]), name='b2')
-            self.z2 = tf.nn.dropout(tf.nn.relu(tf.add(tf.matmul(self.z1, self.w2), self.b2)), keep_prob=self.keep_prob)
+            self.z2 = tf.nn.dropout(tf.nn.relu(tf.add(tf.matmul(self.z1, self.w2), self.b2)),
+                                    keep_prob=self.keep_prob)
 
-            self.w3 = tf.get_variable('w2', [256, 512], initializer=tf.random_uniform_initializer(0, 1))
-            self.b3 = tf.Variable(tf.constant(0.01, shape=[512, ]), name='b2')
-            self.z3 = tf.nn.dropout(tf.nn.tanh(tf.add(tf.matmul(self.z2, self.w3), self.b3)), keep_prob=self.keep_prob)
-
-            self.w4 = tf.get_variable('w2', [512, self.env.action_space.n], initializer=tf.random_uniform_initializer(0, 1))
-            self.b4 = tf.Variable(tf.constant(0.01, shape=[self.env.action_space.n, ]))
-            self.q_val = tf.add(tf.matmul(self.z3, self.w4), self.b4)
-
+            self.w3 = tf.get_variable('w3', [256, env.action_space.n], initializer=tf.random_uniform_initializer(0, 0.1))
+            self.b3 = tf.Variable(tf.constant(0.01, shape=[env.action_space.n, ]))
+            self.q_val = tf.add(tf.matmul(self.z2, self.w3), self.b3)
             return self.q_val
 
     def select_action(self, obs, evaluation_mode=False):
@@ -104,15 +112,69 @@ class DQN(object):
         finished. This may be reducing exploration, etc.
 
         Currently returns a random action.
+        
+        Return either a random action or the argmax action based upon whether doing exploration or not
         """
-        return env.action_space.sample()
+        q_val = self.q_val.eval(session=self.sess, feed_dict={self.observation_input: [obs], self.keep_prob: .85})[0]
+        if evaluation_mode == True:
+            return np.argmax(q_val)[0]
+        if random.random() <= self.eps_start:
+            return random.randint(0, env.action_space.n - 1)
+        else:
+            return np.argmax(q_val)
+
+    def train_network(self, obs, action, reward, next_obs, done):
+        """
+        Helper code to call the optimizer
+        :param obs: current observations
+        :param action: current action to perform
+        :param reward: reward in the current observation state
+        :param next_obs: next observation from the environment
+        :param done: reached the goal or not
+        """
+        encoded_action = np.zeros(env.action_space.n)
+        encoded_action[action] = 1
+        self.replay_memory.append((obs, encoded_action, reward, next_obs, done))
+        if len(self.replay_memory) > self.min_replay_size:
+            self.replay_memory.popleft()
+        if len(self.replay_memory) > self.batch_size:
+            self.perform_optim()
+
+    def perform_optim(self):
+        self.num_steps += 1
+        for i in range(1):
+            curr_batch = random.sample(self.replay_memory, self.batch_size)  # Sampling a batch randomly from memory
+            obs_batch = [curr_data[0] for curr_data in curr_batch]
+            action_batch = [curr_data[1] for curr_data in curr_batch]
+            reward_batch = [curr_data[2] for curr_data in curr_batch]
+            next_obs_batch = [curr_data[3] for curr_data in curr_batch]
+
+            y_batch = []
+            q_val_batch = self.q_val.eval(session = self.sess, feed_dict = {self.observation_input: next_obs_batch, self.keep_prob: 0.85})
+            for j in range(0, self.batch_size):
+                curr_run = curr_batch[j][4]
+                if curr_run:
+                    y_batch.append(reward_batch[j])
+                else:
+                    y_batch.append(reward_batch[j] + self.gamma * np.max(q_val_batch[j]))
+            feed_out = [self.optimizer]
+            feed_dict = {self.y: y_batch,
+                             self.action_input: action_batch,
+                             self.observation_input: obs_batch,
+                             self.keep_prob: 0.85}
+            _ = self.sess.run(feed_out, feed_dict)
+
 
     def update(self):
         """
         TODO: Implement the functionality to update the network according to the
         Q-learning rule
+        Calculates the l2 loss and calls the optimizer
         """
-        raise NotImplementedError
+        q_learning_action = tf.reduce_sum(tf.multiply(self.q_val, self.action_input), reduction_indices=1)
+        self.loss = tf.reduce_mean(tf.square(self.y - q_learning_action))
+        self.optimizer = tf.train.AdamOptimizer(1e-4).minimize(self.loss)
+
 
     def train(self):
         """
@@ -123,38 +185,81 @@ class DQN(object):
             2. Updating the network at some frequency
             3. Backing up the current parameters to a reference, target network
         """
-        done = False
-        obs = env.reset()
-        while not done:
-            action = self.select_action(obs, evaluation_mode=False)
-            next_obs, reward, done, info = env.step(action)
-            self.num_steps += 1
-        self.num_episodes += 1
+        # Initially perform some random walks and make a replay memory
+        env = Monitor(self.env, self.monitor_dir, force=True)
+        for episode in range(1000):
+            done = False
+            obs = env.reset()
+            while not done:
+                action = random.randint(0, env.action_space.n - 1)
+                encoded_action = np.zeros(env.action_space.n)
+                encoded_action[action] = 1
+                next_obs, reward, done, info = env.step(action)
+                self.replay_memory.append((obs, encoded_action, reward, next_obs, done))
+                obs = next_obs
+                if len(self.replay_memory) > self.min_replay_size:
+                    self.replay_memory.popleft()
 
-    def eval(self, save_snapshot=True):
-        """
-        Run an evaluation episode, this will call
-        """
-        total_reward = 0.0
-        ep_steps = 0
-        done = False
-        obs = env.reset()
-        while not done:
-            env.render()
-            action = self.select_action(obs, evaluation_mode=True)
-            obs, reward, done, info = env.step(action)
-            total_reward += reward
-        print ("Evaluation episode: ", total_reward)
-        if save_snapshot:
-            print ("Saving state with Saver")
-            self.saver.save(self.sess, 'models/dqn-model', global_step=self.num_episodes)
+        sum_of_reward = 0
+        for episode in range(self.max_episode + 1):
+            obs = env.reset()
+            if self.eps_start > self.eps_mid:
+                self.eps_start -= (initial_eps - mid_eps) / self.eps_decay  # Linear decay of exploration
+            elif self.eps_start > self.eps_end:
+                self.eps_start -= (mid_eps - final_eps) / self.eps_decay_later
+            done = False            #     self.num_steps += 1
+            # self.num_episodes += 1
+            reward_per_episode = 0
+            while not done:
+                action = self.select_action(obs)
+                next_obs, reward, done, info = env.step(action)
+                self.train_network(obs, action, reward, next_obs, done)
+                obs = next_obs
+                reward_per_episode += reward
+            sum_of_reward += reward_per_episode
+            if episode % 100 == 0:
+                avg_reward = sum_of_reward / 100
+                self.saver.save(self.sess, 'models/dqn-model')
+                print("Avg reward: %s" % avg_reward)
+                if avg_reward > 210:
+                    test_reward = 0
+                    for i in range(self.sanity_epochs):
+                        obs = env.reset()
+                        done = False
+                        while not done:
+                            action = self.select_action(obs, evaluation_mode=True)
+                            next_obs, reward, done, info = env.step(action)
+                            test_reward += reward
+                    avg_test_reward = test_reward / self.sanity_epochs
+                    print("Episode: ", episode, "Average test reward: ", avg_test_reward)
+                    if avg_test_reward >= 200:
+                        env.close()
+                        break
+                sum_of_reward = 0
+
+
+    # Performing eval inside train after every 100 episodes
+    # def eval(self, save_snapshot=True):
+    #     """
+    #     Run an evaluation episode, this will call
+    #     """
+    #     total_reward = 0.0
+    #     ep_steps = 0
+    #     done = False
+    #     obs = env.reset()
+    #     while not done:
+    #         env.render()
+    #         action = self.select_action(obs, evaluation_mode=True)
+    #         obs, reward, done, info = env.step(action)
+    #         total_reward += reward
+    #     print ("Evaluation episode: ", total_reward)
+    #     if save_snapshot:
+    #         print ("Saving state with Saver")
+    #         self.saver.save(self.sess, 'models/dqn-model', global_step=self.num_episodes)
 
 def train(dqn):
-    for i in count(1):
-        dqn.train()
-        # every 10 episodes run an evaluation episode
-        if i % 10 == 0:
-            dqn.eval()
+    dqn.train()
+
 
 def eval(dqn):
     """
@@ -175,6 +280,9 @@ if __name__ == '__main__':
     # may require some fine tuning.
     env = gym.make('LunarLander-v2')
     env.seed(args.seed)
+    initial_eps = 1
+    mid_eps = 0.1
+    final_eps = 0.01
     # Consider using this for the challenge portion
     # env = env_wrappers.wrap_env(env)
 
