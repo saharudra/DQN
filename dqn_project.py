@@ -44,6 +44,7 @@ class DQN(object):
         self.eps_start = initial_eps
         self.eps_end = final_eps
         self.eps_mid = mid_eps
+        self.change_eps = True
         self.eps_decay = 2000
         self.eps_decay_later = 3000# in episodes
         # If using a target network
@@ -203,10 +204,13 @@ class DQN(object):
         sum_of_reward = 0
         for episode in range(self.max_episode + 1):
             obs = env.reset()
-            if self.eps_start > self.eps_mid:
-                self.eps_start -= (initial_eps - mid_eps) / self.eps_decay  # Linear decay of exploration
-            elif self.eps_start > self.eps_end:
-                self.eps_start -= (mid_eps - final_eps) / self.eps_decay_later
+            if self.change_eps == True:
+                if self.eps_start > self.eps_mid:
+                    self.eps_start -= (initial_eps - mid_eps) / self.eps_decay  # Linear decay of exploration
+                elif self.eps_start > self.eps_end:
+                    self.eps_start -= (mid_eps - final_eps) / self.eps_decay_later
+            else:
+                self.eps_start = initial_eps
             done = False            #     self.num_steps += 1
             # self.num_episodes += 1
             reward_per_episode = 0
